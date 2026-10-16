@@ -1565,6 +1565,10 @@ class REACHER:
         if self.program_flag.is_set():
             self.program_flag.clear()
         self.program_running = True
+        # Cleared here, not in stop_program: firmware can end the session on
+        # its own (an unarmed Pavlovian run ends on the first loop tick), and
+        # that END must still count when Stop is pressed later.
+        self._controller_end_received.clear()
         try:
             self.send_serial_command({"cmd": 101})
         except Exception:
@@ -1601,7 +1605,6 @@ class REACHER:
                 self.logger.warning("on_stop callback failed", exc_info=True)
 
         # Then do cleanup (send firmware END, close serial, etc.)
-        self._controller_end_received.clear()
         port_open = getattr(self.ser, "is_open", False)
         if port_open:
             try:

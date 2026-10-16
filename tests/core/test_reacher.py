@@ -1533,3 +1533,54 @@ class TestDevicelessParamRecords:
                 assert instance.firmware_information[key] == value
         assert not instance._firmware_ready.is_set()
 
+
+class TestStopAfterFirmwareEnd:
+    """CLI-4: an unarmed Pavlovian session ends itself on the first loop tick,
+    so the CONTROLLER END lands before Stop. The later cmd 100 hits the
+    firmware's "already ended" early return, so no second END is sent.
+    """
+
+    END = json.dumps({"level": "007", "device": "CONTROLLER", "event": "END", "timestamp": 87})
+
+    @pytest.fixture
+    def instance(self, reacher, mocker, mock_serial):
+        reacher.ser.is_open = True
+        reacher.logger = logging.getLogger("test.stopafterend")
+        for name in ("_join_queue_with_timeout", "close_serial", "_write_event_log",
+                     "_close_event_log", "_auto_export", "_write_session_summary",
+                     "_write_controller_log"):
+            mocker.patch.object(reacher, name)
+        return reacher
+
+    def test_stop_after_end_is_prompt_and_quiet(self, instance, caplog):
+        instance.start_program()
+        instance.handle_data(self.END)
+
+        with patch("reacher.kernel.reacher.time.sleep") as sleep, \
+                caplog.at_level(logging.DEBUG, logger="test.stopafterend"):
+            start = time.monotonic()
+            instance.stop_program()
+            elapsed = time.monotonic() - start
+
+        assert elapsed < 1.0, f"stop_program() took {elapsed:.2f}s"
+        assert "Timed out waiting for CONTROLLER END" not in caplog.text
+        assert "export may be incomplete" not in caplog.text
+        assert (2,) not in [c.args for c in sleep.call_args_list]
+
+    def test_end_from_previous_run_does_not_satisfy_next_stop(self, instance, mocker, caplog):
+        instance.start_program()
+        instance.handle_data(self.END)
+        instance.stop_program()
+        instance.ser.is_open = True
+
+        instance.start_program()
+        assert not instance._controller_end_received.is_set()
+
+        ev = instance._controller_end_received
+        wait = mocker.patch.object(ev, "wait", side_effect=lambda timeout=None: ev.is_set())
+        with patch("reacher.kernel.reacher.time.sleep"), \
+                caplog.at_level(logging.WARNING, logger="test.stopafterend"):
+            instance.stop_program()
+
+        wait.assert_called_once()
+        assert "Timed out waiting for CONTROLLER END" in caplog.text
