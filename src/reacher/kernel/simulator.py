@@ -787,10 +787,9 @@ class FirmwareSimulator:
 
         The timeout fields appear only on fr/pr/vi, whose sketches carry them.
         The sketches' device-less extras (``pr_step``, ``variable_interval``,
-        ``omission_interval`` and Pavlovian's second row) are left out: the
-        kernel keys level-000 rows on ``device`` and answers them with a
-        ``kernel_error`` event, so emitting them here would only inject errors
-        that no setting asked for.
+        ``omission_interval`` and Pavlovian's second row) are left out; the
+        kernel only folds them into ``firmware_information``, so they add
+        nothing a simulated run needs.
         """
         controller = {"level": "000", "device": "CONTROLLER", "paradigm": self.schedule}
         if self._is_pav:

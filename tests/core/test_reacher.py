@@ -1492,3 +1492,44 @@ class TestSimulatorControllerEnd:
         assert elapsed < 3.0, f"stop_program() took {elapsed:.2f}s — CONTROLLER END likely timed out"
         assert sim_reacher._controller_end_received.is_set()
         assert sim_reacher.program_flag.is_set()
+
+
+class TestDevicelessParamRecords:
+    """CLI-3: pr/vi/omission/pavlovian print level-000 session-parameter rows
+    with no ``device`` key at StartSession. They used to KeyError in
+    update_firmware_information and surface as an ERROR log + kernel_error.
+    """
+
+    RECORDS = [
+        {"level": "000", "pr_step": 1},
+        {"level": "000", "variable_interval": 15000},
+        {"level": "000", "omission_interval": 20000},
+        {"level": "000", "cs_plus_freq": 6000, "cs_minus_freq": 12000, "cue_duration": 2000,
+         "trace_interval": 1000, "consumption_ms": 3000, "iti_mean": 30000,
+         "iti_min": 20000, "iti_max": 40000},
+    ]
+
+    @pytest.fixture
+    def instance(self, reacher, mocker):
+        reacher.logger = logging.getLogger("test.paramrecord")
+        mocker.patch.object(reacher, "_write_controller_log")
+        reacher._emit = Mock()
+        return reacher
+
+    @pytest.mark.parametrize("record", RECORDS, ids=["pr", "vi", "omission", "pavlovian"])
+    def test_record_is_stored_without_error(self, instance, record, caplog):
+        hardware_before = list(instance.hardware_settings)
+
+        with caplog.at_level(logging.DEBUG, logger="test.paramrecord"):
+            instance.handle_data(json.dumps(record))
+
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        emitted = [c.args[0] for c in instance._emit.call_args_list]
+        assert "kernel_error" not in emitted
+        assert "config" not in emitted
+        assert instance.hardware_settings == hardware_before
+        for key, value in record.items():
+            if key != "level":
+                assert instance.firmware_information[key] == value
+        assert not instance._firmware_ready.is_set()
+

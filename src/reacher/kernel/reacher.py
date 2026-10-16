@@ -870,6 +870,15 @@ class REACHER:
         return {**{k: v for k, v in event.items() if k not in ("param", "value")}, event["param"]: event["value"]}
 
     def update_firmware_information(self, event: dict) -> None:
+        if "device" not in event:
+            # Session-parameter extras of the StartSession dump (pr_step,
+            # variable_interval, omission_interval, Pavlovian timing). Not a
+            # device row, and not emitted as config: the web store appends a
+            # fresh hardware row for every device-less config record.
+            with self.thread_lock:
+                self.firmware_information.update(event)
+            self.logger.info("--> Updated session parameters: %s", event)
+            return
         param_row = self._normalise_param_change(event)
         if event["device"] == "CONTROLLER":
             with self.thread_lock:  # Fix: F-009 — guard cross-thread dict access
