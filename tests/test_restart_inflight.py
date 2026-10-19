@@ -119,16 +119,33 @@ def test_restart_drops_infusion_dequeued_before_clear(monkeypatch):
 
 
 def _behavior_rows(kernel):
+    return [row for row in _event_rows(kernel) if row.get("type") == "behavior"]
+
+
+def _event_rows(kernel):
     kernel.flush_event_log()
     rows = []
     with open(kernel.get_event_log_path()) as handle:
         for line in handle:
             if not line.strip():
                 continue
-            row = json.loads(line)
-            if row.get("type") == "behavior":
-                rows.append(row)
+            # A poll can observe a line the queue thread has not finished writing.
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
     return rows
+
+
+def _await_behavior_timestamps(kernel, expected, timeout=5):
+    deadline = time.monotonic() + timeout
+    last = []
+    while time.monotonic() < deadline:
+        last = [row.get("start_timestamp") for row in _behavior_rows(kernel)]
+        if all(timestamp in last for timestamp in expected):
+            return last
+        time.sleep(0.01)
+    return last
 
 
 def _start_queue_thread_held(kernel):
@@ -223,5 +240,60 @@ def test_restart_full_requeue_keeps_pre_restart_line_in_event_log(monkeypatch):
         assert 2500 not in buffered
         assert kernel.get_total_infusion_count() == 0
         assert kernel.get_infusions_by_pump() == {"PUMP_1": 0, "PUMP_2": 0}
+    finally:
+        _stop_queue_thread(kernel, release)
+
+
+def _infusion(timestamp):
+    return {
+        "level": "007",
+        "device": "PUMP_1",
+        "pin": 4,
+        "event": "INFUSION",
+        "start_timestamp": timestamp,
+        "end_timestamp": timestamp,
+    }
+
+
+def test_restart_requeue_logs_pre_restart_lines_before_new_session(monkeypatch):
+    """Pre-restart lines stay ahead of a line that arrives between drain and requeue.
+
+    Requeue appends, so that new-session line is logged first and event_log.jsonl
+    is out of order around the restart. The drained lines have to be recorded
+    first. They still must not re-enter the cleared session.
+    """
+    monkeypatch.setattr("reacher.kernel.reacher.time", _NoSleep())
+
+    kernel = REACHER(session_id="restart-requeue-order")
+    kernel.ser = Mock(is_open=True, baudrate=115200)
+    kernel.program_running = True
+    kernel.program_flag.clear()
+    kernel.serial_flag.clear()
+
+    release = _start_queue_thread_held(kernel)
+    try:
+        kernel.queue.put_nowait(json.dumps(_infusion(2500)))
+        kernel.queue.put_nowait(json.dumps(_infusion(2501)))
+        real_take = kernel._take_queued_lines
+
+        def _insert_new_session_line():
+            pending, saw_sentinel = real_take()
+            queued = [json.loads(line)["start_timestamp"] for _epoch, line in pending]
+            assert queued == [2500, 2501], queued
+            kernel.queue.put_nowait(json.dumps(_infusion(3001)))
+            return pending, saw_sentinel
+
+        kernel._take_queued_lines = _insert_new_session_line
+        kernel.restart_program()
+        release.set()
+
+        timestamps = _await_behavior_timestamps(kernel, (2500, 2501, 3001))
+        assert timestamps == [2500, 2501, 3001], timestamps
+        buffered = [row.get("start_timestamp") for row in kernel.get_behavior_data()]
+        assert 2500 not in buffered
+        assert 2501 not in buffered
+        assert 3001 in buffered
+        assert kernel.get_total_infusion_count() == 1
+        assert kernel.get_infusions_by_pump() == {"PUMP_1": 1, "PUMP_2": 0}
     finally:
         _stop_queue_thread(kernel, release)
