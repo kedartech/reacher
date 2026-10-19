@@ -158,3 +158,79 @@ def test_destroy_during_close_does_not_touch_closed_port(monkeypatch, caplog):
         f"ops on closed port: {port.touched_while_closed}"
     )
     assert port.touched_while_closed == []
+
+
+def _wired_session():
+    """A session whose port follows pyserial's closed-port contract."""
+    sm = SessionManager()
+    sid = sm.create_session("SIMULATOR", "fr")
+    instance = sm.get_instance(sid)
+    port = _HardwareSerial()
+    port.open()
+    instance.ser = port
+    instance.serial_thread = _finished_thread("read_serial")
+    instance.queue_thread = _finished_thread("handle_queue")
+    instance.time_check_thread = _finished_thread("monitor_time_limit")
+    return sm, sid, instance, port
+
+
+def _release_session(sm, sid, instance) -> None:
+    if sm._sessions.get(sid) is not None:
+        sm.destroy_session(sid)
+    instance.shutdown()
+
+
+def test_close_serial_completes_while_thread_lock_held():
+    """close_serial must finish even if thread_lock is held or contended.
+
+    The close path does not take ``thread_lock``. A caller that already owns
+    it, and a close that runs while another thread owns it, both have to
+    return. Blocking on that lock deadlocks the first and stalls the second
+    for as long as ``send_serial_command`` holds it.
+    """
+    sm, sid, instance, port = _wired_session()
+    try:
+        release = threading.Event()
+        held = threading.Event()
+
+        def hold() -> None:
+            with instance.thread_lock:
+                held.set()
+                assert release.wait(timeout=5)
+
+        holder = threading.Thread(target=hold, name="hold-thread-lock", daemon=True)
+        holder.start()
+        assert held.wait(timeout=5), "holder did not acquire thread_lock"
+
+        done = threading.Event()
+
+        def close_while_contended() -> None:
+            instance.close_serial()
+            done.set()
+
+        closer = threading.Thread(target=close_while_contended, name="close-contended", daemon=True)
+        closer.start()
+        # The pre-flush pause is 0.5s. Anything past that is waiting on thread_lock.
+        assert done.wait(timeout=2), "close_serial blocked while another thread held thread_lock"
+        closer.join(timeout=1)
+        release.set()
+        holder.join(timeout=2)
+
+        assert not port.is_open
+        assert port.touched_while_closed == []
+        assert not holder.is_alive()
+
+        port.open()
+
+        def close_while_holding() -> None:
+            with instance.thread_lock:
+                instance.close_serial()
+
+        same = threading.Thread(target=close_while_holding, name="close-holding-lock", daemon=True)
+        same.start()
+        same.join(timeout=2)
+        assert not same.is_alive(), "close_serial deadlocked on a thread_lock the caller already held"
+        assert not port.is_open
+        assert port.touched_while_closed == []
+    finally:
+        _release_session(sm, sid, instance)
