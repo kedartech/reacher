@@ -186,6 +186,10 @@ class REACHER:
         self._simulated_paradigm: Optional[str] = None
         self.ser: serial.Serial = serial.Serial(baudrate=115200, timeout=1)
         self.queue: queue.Queue = queue.Queue(maxsize=5000)
+        # Bytes from a readline() that returned before the newline. Connect
+        # drains the bootloader with reset_input_buffer(), which slices the
+        # identification line setup() prints; the piece is not a frame.
+        self._rx_fragment: bytes = b""
         # Fix: F-003 — Configurable serial reconnection parameters
         self._SERIAL_RECONNECT_RETRIES: int = 3
         self._SERIAL_RECONNECT_DELAY: int = 3  # seconds between retry attempts
@@ -402,6 +406,7 @@ class REACHER:
         else:
             self.ser = serial.Serial(baudrate=115200, timeout=1)
         self.queue = queue.Queue(maxsize=5000)  # Fix: F-006 — Match __init__ maxsize
+        self._rx_fragment = b""
 
         # Old threads must be gone before the flags flip back: a surviving read_serial
         # would otherwise keep reading the rebuilt serial object.
@@ -516,7 +521,11 @@ class REACHER:
             self.time_check_thread.start()
         time.sleep(2)
         self.ser.reset_input_buffer()
-        
+        # Drop a short read taken before this drain. The bytes still in the
+        # driver buffer were just discarded, so that fragment must not be
+        # glued onto the next frame.
+        self._rx_fragment = b""
+
         self.logger.info("--> Serial connection opened")
 
     def clear_queue(self) -> None:
@@ -670,6 +679,31 @@ class REACHER:
             name=name,
         )
 
+    def _assemble_rx_frame(self, data: bytes) -> Optional[bytes]:
+        """Return one newline-terminated frame, or None if ``data`` is not one yet.
+
+        ``readline()`` returns on ``\\n`` or when the 1s timeout expires.
+        ``open_serial`` waits out the bootloader and then calls
+        ``reset_input_buffer()`` while this thread may already be inside
+        ``readline()``. ``setup()`` prints ``SendIdentification()`` in that
+        window, so the read comes back as the tail of that line (through the
+        newline) or as the head with no newline. A held head is dropped when
+        the next read itself starts an object, so it cannot be glued onto the
+        IDENTIFY reply that connect waits for.
+        """
+        if not data:
+            return None
+        if self._rx_fragment and data.lstrip().startswith(b"{"):
+            self.logger.debug("Dropping sliced serial fragment (%d bytes)", len(self._rx_fragment))
+            self._rx_fragment = b""
+        if not data.endswith(b"\n"):
+            self._rx_fragment += data
+            self.logger.debug("Holding incomplete serial line (%d bytes)", len(self._rx_fragment))
+            return None
+        frame = self._rx_fragment + data
+        self._rx_fragment = b""
+        return frame
+
     def read_serial(self) -> None:
         """Read data from the serial port and queue it for processing.
 
@@ -682,15 +716,23 @@ class REACHER:
             try:
                 if self.ser.is_open and self.ser.in_waiting > 0:
                     # Fix: SER-004 — Read outside lock, only queue inside lock
-                    data = self.ser.readline()
+                    frame = self._assemble_rx_frame(self.ser.readline())
+                    if frame is None:
+                        continue
                     # Fix: SER-001 — Strict UTF-8 decode; discard corrupt lines
                     try:
-                        decoded = data.decode(encoding='utf-8', errors='strict').strip()
+                        decoded = frame.decode(encoding='utf-8', errors='strict').strip()
                     except UnicodeDecodeError:
-                        self.logger.warning("Corrupt serial data (non-UTF-8), discarding: %s", data.hex())
+                        self.logger.warning("Corrupt serial data (non-UTF-8), discarding: %s", frame.hex())
                         _diag_log("serial.rx_corrupt", tier=_TIER_WIRE, lvl="warn",
                                   src="reacher.kernel", session_id=self.session_id,
-                                  hex=data.hex()[:512])
+                                  hex=frame.hex()[:512])
+                        continue
+                    # Firmware events are JSON objects. The tail of the boot
+                    # identification line (or a blank line) is not one, and
+                    # json.loads on it is the connect-time parse error.
+                    if not decoded.startswith("{"):
+                        self.logger.debug("Discarding non-JSON serial line: %r", decoded)
                         continue
                     self.logger.info(f"Serial data received: {decoded}")
                     # Verbatim wire record.  Carries session_id but no corr_id:
@@ -740,6 +782,7 @@ class REACHER:
                             self.ser.close()
                         self.ser.open()
                         self.ser.reset_input_buffer()
+                        self._rx_fragment = b""
                         self.logger.info("Serial reconnected on attempt %d", attempt)
                         self._emit("reconnected", {"attempt": attempt})
                         reconnected = True

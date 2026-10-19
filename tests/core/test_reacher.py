@@ -345,6 +345,25 @@ class TestBootBannerNotParsedAsJson:
         assert reacher.firmware_information["sketch"] == "fr.ino"
         assert reacher._firmware_ready.is_set()
 
+    def test_timeout_split_of_one_json_line_is_reassembled(self, reacher, mocker):
+        cut = 24
+        head = _BOOT_IDENTIFICATION[:cut].encode()
+        tail = (_BOOT_IDENTIFICATION[cut:] + "\n").encode()
+        assert head.startswith(b"{") and not tail.decode().lstrip().startswith("{")
+
+        queued, errors = self._apply(reacher, mocker, [head, tail])
+
+        assert queued == [_BOOT_IDENTIFICATION]
+        assert not any("Failed to parse JSON" in msg for msg in errors)
+        assert reacher.firmware_information["sketch"] == "fr.ino"
+
+    def test_malformed_json_object_still_logs_an_error(self, reacher, mocker):
+        queued, errors = self._apply(reacher, mocker, [b'{"level":\n'])
+
+        assert queued == ['{"level":']
+        assert any("Failed to parse JSON" in msg for msg in errors)
+        assert reacher.firmware_information.get("sketch") is None
+
 
 def test_send_serial_command(reacher, mock_serial):
     """Test that send_serial_command sends JSON when port is open, raises error when closed."""
