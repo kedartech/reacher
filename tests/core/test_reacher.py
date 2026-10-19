@@ -254,6 +254,98 @@ def test_close_serial(reacher, mock_serial):
     assert reacher.serial_flag.is_set()
 
 
+# The line setup() prints, and the line IDENTIFY prints again (fr.ino SendIdentification).
+_BOOT_IDENTIFICATION = (
+    '{"level":"000","device":"CONTROLLER","sketch":"fr.ino",'
+    '"version":"v3.4.0-beta.9","baud_rate":115200,"schedule":"FIXED_RATIO"}'
+)
+
+
+def _pump_serial_lines(reacher, lines, mocker):
+    """Drive read_serial with bytes readline() would return, then drain the queue."""
+    mocker.patch("time.sleep")
+    pending = list(lines)
+
+    class _Port:
+        is_open = True
+        timeout = 1
+
+        @property
+        def in_waiting(self):
+            if not pending:
+                reacher.serial_flag.set()
+                return 0
+            return 1
+
+        def readline(self):
+            return pending.pop(0)
+
+    reacher.ser = _Port()
+    reacher.serial_flag.clear()
+    reacher.read_serial()
+    queued = []
+    while not reacher.queue.empty():
+        queued.append(reacher.queue.get_nowait())
+    return queued
+
+
+class TestBootBannerNotParsedAsJson:
+    """A connect can hand the boot identification line to the JSON parser in pieces.
+
+    open_serial starts the reader, waits out the bootloader, then
+    reset_input_buffer(). setup() has already printed SendIdentification.
+    readline() returns on newline or on the 1s timeout, so that drain leaves
+    either the tail of the line (through the newline) or the head with no
+    newline. handle_data json.loads every queued line and logs
+    "Failed to parse JSON" at ERROR. The IDENTIFY exchange that follows is a
+    whole frame; connect waits on that, and it must still be applied.
+    """
+
+    def _errors(self, reacher, mocker):
+        seen = []
+        mocker.patch.object(
+            reacher.logger,
+            "error",
+            side_effect=lambda msg, *args, **kwargs: seen.append(str(msg)),
+        )
+        return seen
+
+    def _apply(self, reacher, mocker, lines):
+        mocker.patch("builtins.open", mocker.mock_open())
+        mocker.patch("os.fsync")
+        errors = self._errors(reacher, mocker)
+        queued = _pump_serial_lines(reacher, lines, mocker)
+        for line in queued:
+            reacher.handle_data(line)
+        return queued, errors
+
+    def test_banner_tail_is_not_ingested_as_json(self, reacher, mocker):
+        cut = _BOOT_IDENTIFICATION.index('"sketch"') + 3
+        tail = (_BOOT_IDENTIFICATION[cut:] + "\n").encode()
+        ident = (_BOOT_IDENTIFICATION + "\n").encode()
+        assert not tail.decode().lstrip().startswith("{")
+
+        queued, errors = self._apply(reacher, mocker, [tail, ident])
+
+        assert queued == [_BOOT_IDENTIFICATION]
+        assert not any("Failed to parse JSON" in msg for msg in errors)
+        assert reacher.firmware_information["sketch"] == "fr.ino"
+        assert reacher._firmware_ready.is_set()
+
+    def test_banner_head_is_not_glued_onto_the_next_frame(self, reacher, mocker):
+        cut = _BOOT_IDENTIFICATION.index('"sketch"') + 3
+        head = _BOOT_IDENTIFICATION[:cut].encode()
+        ident = (_BOOT_IDENTIFICATION + "\n").encode()
+        assert head.startswith(b"{") and not head.endswith(b"\n")
+
+        queued, errors = self._apply(reacher, mocker, [head, ident])
+
+        assert queued == [_BOOT_IDENTIFICATION]
+        assert not any("Failed to parse JSON" in msg for msg in errors)
+        assert reacher.firmware_information["sketch"] == "fr.ino"
+        assert reacher._firmware_ready.is_set()
+
+
 def test_send_serial_command(reacher, mock_serial):
     """Test that send_serial_command sends JSON when port is open, raises error when closed."""
     reacher.ser.is_open = True
