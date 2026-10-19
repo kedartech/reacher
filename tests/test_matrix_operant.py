@@ -75,6 +75,36 @@ def _rows(client, sid, device, event):
     return [r for r in behavior(client, sid) if r.get("device") == device and r.get("event") == event]
 
 
+def _snapshot_export(client, sid):
+    """Copy behavior rows and per-pump infusion counters under the kernel lock.
+
+    A restarted session is still emitting, so the buffer and the counters have to
+    be read together or a reward can land between the two reads.
+    """
+    instance = client.app.state.session_manager.get_session(sid).instance
+    with instance.thread_lock:
+        rows = [dict(row) for row in instance.behavior_data]
+        by_pump = {
+            pump: instance._cumulative_infusions_by_pump[pump] + instance._infusions_by_pump[pump]
+            for pump in ("PUMP_1", "PUMP_2")
+        }
+    return rows, by_pump
+
+
+def _pump_infusions(rows, pump):
+    """Infusion rows counted toward ``pump``. Firmware also spells pump 1 as ``PUMP``."""
+    devices = ("PUMP", "PUMP_1") if pump == "PUMP_1" else (pump,)
+    return [row for row in rows if row.get("device") in devices and row.get("event") == "INFUSION"]
+
+
+def _last_controller_start(rows):
+    for index in range(len(rows) - 1, -1, -1):
+        row = rows[index]
+        if row.get("device") == "CONTROLLER" and row.get("event") == "START":
+            return index
+    return None
+
+
 def _cards(client, sid):
     """The per-device rows behind ``hardware_settings``, keyed by device name."""
     return {r["device"]: r for r in config(client, sid)["hardware_settings"]}
@@ -427,14 +457,35 @@ def test_row26_pause_is_excluded_from_time_limit(sim_client):
 
 
 def test_row26_restart_resets_counters(sim_client):
-    """Not reconciled: the event log is session-long by design, while restart clears the export."""
+    """Restart clears the in-memory export and zeroes the infusion counters.
+
+    The event log stays session-long, so this row is not reconciled against it.
+    The restarted session keeps running, and at the harness speed a new reward can
+    land before this read. That reward follows the new CONTROLLER START. Rows ahead
+    of that START are the ones the clear has to have dropped, and the counters have
+    to match the infusions still in the buffer.
+    """
     client = sim_client
     with simulator_session(client, "fr") as sid:
         _arm_operant(client, sid, ratio=1)
         assert start(client, sid).status_code == 200
         wait_until(lambda: _rows(client, sid, "PUMP_1", "INFUSION"), timeout=5)
+        pre_rows, pre_pumps = _snapshot_export(client, sid)
+        assert _pump_infusions(pre_rows, "PUMP_1")
+        assert pre_pumps["PUMP_1"] >= 1
+
         assert restart(client, sid).status_code == 200
-        assert not _rows(client, sid, "PUMP_1", "INFUSION")
+
+        rows, by_pump = _snapshot_export(client, sid)
+        # The old START sits at index 0 when the clear has not replaced the buffer,
+        # so the slice below would be empty and the pre-restart rows would still be
+        # the head of the export.
+        assert rows[: len(pre_rows)] != pre_rows
+        start_at = _last_controller_start(rows)
+        leaked = rows if start_at is None else rows[:start_at]
+        assert leaked == []
+        for pump in ("PUMP_1", "PUMP_2"):
+            assert by_pump[pump] == len(_pump_infusions(rows, pump))
         stop(client, sid)
 
 
