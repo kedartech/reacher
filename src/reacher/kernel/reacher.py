@@ -1048,10 +1048,15 @@ class REACHER:
             try:
                 self.queue.put_nowait(item)
             except queue.Full:
-                # The queue thread is alive, so handle_data here would race it.
-                # Logging the raw line is the leftover when a producer filled
-                # the queue again between the drain and this put.
-                self.logger.error("Restart could not requeue a pre-swap line: %s", item[2])
+                # The queue thread is alive, so it will never see a line that
+                # cannot be put back. Log it here. The epoch tag still keeps
+                # it out of the new session, and _dequeued_epoch is thread-local,
+                # so this sample does not clobber the queue thread's.
+                self.logger.error(
+                    "Restart could not requeue a pre-swap line; writing it to the event log: %s",
+                    item[2],
+                )
+                self._log_replay_lines([item])
         self._restore_sentinel(saw_sentinel)
 
     def _restore_sentinel(self, saw_sentinel: bool) -> None:
