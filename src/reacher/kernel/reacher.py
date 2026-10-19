@@ -1035,29 +1035,45 @@ class REACHER:
     def _requeue_for_epoch(self, pending: list, old_epoch: int, saw_sentinel: bool) -> None:
         """Put drained lines back tagged with the epoch from before the swap.
 
-        The queue thread logs them and the epoch fence keeps them out of the
-        new session buffers. A stopped queue thread has nobody to do that, so
-        log those lines here instead of leaving them unprocessed.
+        They go in front of lines that arrived after the drain, so the event
+        log keeps pre-restart lines ahead of the new session. The queue thread
+        logs them and the epoch fence keeps them out of the new buffers. A
+        stopped queue thread, or a queue with no room, cannot do that, so log
+        those lines here.
         """
         tagged = [(_REPLAY_EPOCH, old_epoch if epoch is None else epoch, line) for epoch, line in pending]
         if not self.queue_thread.is_alive():
             self._log_replay_lines(tagged)
             self._restore_sentinel(saw_sentinel)
             return
-        for item in tagged:
-            try:
-                self.queue.put_nowait(item)
-            except queue.Full:
-                # The queue thread is alive, so it will never see a line that
-                # cannot be put back. Log it here. The epoch tag still keeps
-                # it out of the new session, and _dequeued_epoch is thread-local,
-                # so this sample does not clobber the queue thread's.
-                self.logger.error(
-                    "Restart could not requeue a pre-swap line; writing it to the event log: %s",
-                    item[2],
-                )
-                self._log_replay_lines([item])
+        if not self._put_replay_ahead(tagged):
+            # Queueing a suffix and logging the rest would split their order.
+            # Write them all here. The epoch tag still fences the new session.
+            self.logger.error(
+                "Restart could not requeue %d pre-swap line(s); writing them to the event log",
+                len(tagged),
+            )
+            self._log_replay_lines(tagged)
         self._restore_sentinel(saw_sentinel)
+
+    def _put_replay_ahead(self, tagged: list) -> bool:
+        """Insert *tagged* in front of whatever was queued after the drain.
+
+        ``queue.Queue.put`` only appends, which logs those later lines first.
+        Returns False when they do not all fit; nothing is queued in that case.
+        """
+        if not tagged:
+            return True
+        with self.queue.mutex:
+            if self.queue.maxsize > 0 and self.queue._qsize() + len(tagged) > self.queue.maxsize:
+                return False
+            # Same bookkeeping as Queue.put. The deque is the queue's storage;
+            # appendleft is the only way to keep the drained lines ahead.
+            for item in reversed(tagged):
+                self.queue.queue.appendleft(item)
+                self.queue.unfinished_tasks += 1
+            self.queue.not_empty.notify()
+        return True
 
     def _restore_sentinel(self, saw_sentinel: bool) -> None:
         if not saw_sentinel:
@@ -1068,7 +1084,12 @@ class REACHER:
             self.logger.warning("Queue full; restart could not restore the queue sentinel")
 
     def _log_replay_lines(self, tagged: list) -> None:
-        """Log drained lines on this thread when the queue thread cannot."""
+        """Log drained lines on this thread.
+
+        Used when the queue thread is not running, and when the queue has no
+        room to take the lines back ahead of the new session. ``_dequeued_epoch``
+        is thread-local, so this sample does not clobber the queue thread's.
+        """
         for _, epoch, line in tagged:
             self._dequeued_epoch.value = epoch
             try:
