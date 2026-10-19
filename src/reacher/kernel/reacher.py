@@ -38,6 +38,10 @@ def _package_version() -> str:
 _FIRMWARE_RX_BUFFER = 128
 
 _USE_VALUE = object()  # sentinel: use the `value` arg from send_command()
+# Queue items drained at restart: (mark, epoch, line). The epoch is the one
+# in force when the line was still queued, so the handler logs it but does
+# not append it to the session the swap installed.
+_REPLAY_EPOCH = object()
 
 _PUMP_KEYS = ("PUMP_1", "PUMP_2")
 # Pavlovian firmware logs pump 1 as "PUMP"; operant firmware logs it as "PUMP_1".
@@ -218,6 +222,11 @@ class REACHER:
         self.queue_thread: threading.Thread = self._make_thread(self.handle_queue, "handle_queue")
         self.time_check_thread: threading.Thread = self._make_thread(self.monitor_time_limit, "monitor_time_limit")
         self.thread_lock: threading.Lock = threading.Lock()
+        # Bumped under thread_lock when restart_program swaps the session
+        # buffers. handle_queue samples it at dequeue so a handler already
+        # running cannot append into the buffers the swap just installed.
+        self._record_epoch: int = 0
+        self._dequeued_epoch = threading.local()
         self.serial_flag: threading.Event = threading.Event()
         self.program_flag: threading.Event = threading.Event()
         self.program_running: bool = False
@@ -773,9 +782,19 @@ class REACHER:
                 if line is None:
                     self.logger.info("Sentinel received. Exiting queue thread.")
                     break
+                if isinstance(line, tuple) and len(line) == 3 and line[0] is _REPLAY_EPOCH:
+                    # Drained at restart. Keep the epoch from before that swap.
+                    epoch, line = line[1], line[2]
+                else:
+                    # Sampled before handle_data so the event-log write stays
+                    # ahead of thread_lock. The append re-checks under the lock.
+                    epoch = self._record_epoch
                 self.logger.info(f"--> Data in queue: {line}")
-
-                self.handle_data(line)
+                self._dequeued_epoch.value = epoch
+                try:
+                    self.handle_data(line)
+                finally:
+                    self._dequeued_epoch.value = None
             except queue.Empty:
                 if self.serial_flag.is_set():
                     break
@@ -977,6 +996,81 @@ class REACHER:
                 emit_data = dict(new_entry)
         self._emit("config", emit_data)
 
+    def _dequeued_epoch_is_current(self) -> bool:
+        """Caller holds ``thread_lock``.
+
+        A line taken off the queue before ``restart_program`` swaps the session
+        buffers carries the epoch sampled at dequeue. It is still written to
+        the event log, but it must not re-seed the new session. Direct callers
+        (no sample) belong to whatever session is current.
+        """
+        dequeued = getattr(self._dequeued_epoch, "value", None)
+        if dequeued is None:
+            return True
+        return dequeued == self._record_epoch
+
+    def _take_queued_lines(self) -> tuple:
+        """Pull every line still on the queue. ``None`` is reported, not returned.
+
+        Replay tuples keep the epoch they were tagged with. Anything else is
+        ``(None, line)`` and the caller stamps the pre-swap epoch.
+        """
+        pending = []
+        saw_sentinel = False
+        while True:
+            try:
+                item = self.queue.get_nowait()
+            except queue.Empty:
+                break
+            self.queue.task_done()
+            if item is None:
+                saw_sentinel = True
+                continue
+            if isinstance(item, tuple) and len(item) == 3 and item[0] is _REPLAY_EPOCH:
+                pending.append((item[1], item[2]))
+            else:
+                pending.append((None, item))
+        return pending, saw_sentinel
+
+    def _requeue_for_epoch(self, pending: list, old_epoch: int, saw_sentinel: bool) -> None:
+        """Put drained lines back tagged with the epoch from before the swap.
+
+        The queue thread logs them and the epoch fence keeps them out of the
+        new session buffers. A stopped queue thread has nobody to do that, so
+        log those lines here instead of leaving them unprocessed.
+        """
+        tagged = [(_REPLAY_EPOCH, old_epoch if epoch is None else epoch, line) for epoch, line in pending]
+        if not self.queue_thread.is_alive():
+            self._log_replay_lines(tagged)
+            self._restore_sentinel(saw_sentinel)
+            return
+        for item in tagged:
+            try:
+                self.queue.put_nowait(item)
+            except queue.Full:
+                # The queue thread is alive, so handle_data here would race it.
+                # Logging the raw line is the leftover when a producer filled
+                # the queue again between the drain and this put.
+                self.logger.error("Restart could not requeue a pre-swap line: %s", item[2])
+        self._restore_sentinel(saw_sentinel)
+
+    def _restore_sentinel(self, saw_sentinel: bool) -> None:
+        if not saw_sentinel:
+            return
+        try:
+            self.queue.put_nowait(None)
+        except queue.Full:
+            self.logger.warning("Queue full; restart could not restore the queue sentinel")
+
+    def _log_replay_lines(self, tagged: list) -> None:
+        """Log drained lines on this thread when the queue thread cannot."""
+        for _, epoch, line in tagged:
+            self._dequeued_epoch.value = epoch
+            try:
+                self.handle_data(line)
+            finally:
+                self._dequeued_epoch.value = None
+
     def update_behavioral_events(self, event: dict) -> None:
         entry_dict: Dict[str, Union[str, int]] = {}
         
@@ -1026,44 +1120,54 @@ class REACHER:
         # Persist to dataset when actively recording, and always for CONTROLLER
         # events (START/END markers must survive the program_running=False guard
         # that stop_program() sets before the END event arrives from firmware).
+        # A line dequeued before the restart swap is already in the event log
+        # above; it must not re-seed the new session's buffers or counters.
+        stale = False
         if (self.program_running and not self.program_flag.is_set()) \
                 or entry_dict.get('device') == 'CONTROLLER':
             infusion_pump = None
             with self.thread_lock:
-                self.behavior_data.append(entry_dict)
-                _type_key = f"{entry_dict.get('device')}.{entry_dict.get('event')}"
-                self._event_type_counts[_type_key] = self._event_type_counts.get(_type_key, 0) + 1
-                pump = _PUMP_DEVICE_KEYS.get(entry_dict.get('device'))
-                if pump and entry_dict.get('event') == 'INFUSION':
-                    self._infusions_by_pump[pump] += 1
-                    if pump == self._reward_pump:
-                        self._infusion_count += 1
-                    infusion_pump = pump
-                elif entry_dict.get('device') in ('LEVER_RH', 'LEVER_LH') \
-                        and str(entry_dict.get('event', '')).endswith('PRESS'):
-                    self._press_count += 1
-                elif entry_dict.get('device') == 'PAVLOV' and entry_dict.get('event') == 'TRIAL_START':
-                    self._trial_count += 1
-                # Fix: F-002 — Warn when data lists grow dangerously large
-                total = len(self.behavior_data) + len(self.frame_data) + len(self.slm_data)
-            if total >= self._DATA_WARNING_THRESHOLD and not self._data_warning_emitted:
-                self._data_warning_emitted = True
-                self.logger.warning(
-                    "Data list size (%d) exceeds threshold (%d) — risk of OOM. "
-                    "event_log.jsonl is the durable backup.",
-                    total, self._DATA_WARNING_THRESHOLD,
-                )
-                self._emit("warning", {
-                    "message": "In-memory data lists are large. Data is safely logged to disk.",
-                    "total_entries": total,
-                    "threshold": self._DATA_WARNING_THRESHOLD,
-                })
-            self.logger.info("--> Updated behavioral data")
-            if infusion_pump:
-                self._emit_infusion_count()
+                if not self._dequeued_epoch_is_current():
+                    stale = True
+                else:
+                    self.behavior_data.append(entry_dict)
+                    _type_key = f"{entry_dict.get('device')}.{entry_dict.get('event')}"
+                    self._event_type_counts[_type_key] = self._event_type_counts.get(_type_key, 0) + 1
+                    pump = _PUMP_DEVICE_KEYS.get(entry_dict.get('device'))
+                    if pump and entry_dict.get('event') == 'INFUSION':
+                        self._infusions_by_pump[pump] += 1
+                        if pump == self._reward_pump:
+                            self._infusion_count += 1
+                        infusion_pump = pump
+                    elif entry_dict.get('device') in ('LEVER_RH', 'LEVER_LH') \
+                            and str(entry_dict.get('event', '')).endswith('PRESS'):
+                        self._press_count += 1
+                    elif entry_dict.get('device') == 'PAVLOV' and entry_dict.get('event') == 'TRIAL_START':
+                        self._trial_count += 1
+                    # Fix: F-002 — Warn when data lists grow dangerously large
+                    total = len(self.behavior_data) + len(self.frame_data) + len(self.slm_data)
+            if not stale:
+                if total >= self._DATA_WARNING_THRESHOLD and not self._data_warning_emitted:
+                    self._data_warning_emitted = True
+                    self.logger.warning(
+                        "Data list size (%d) exceeds threshold (%d) — risk of OOM. "
+                        "event_log.jsonl is the durable backup.",
+                        total, self._DATA_WARNING_THRESHOLD,
+                    )
+                    self._emit("warning", {
+                        "message": "In-memory data lists are large. Data is safely logged to disk.",
+                        "total_entries": total,
+                        "threshold": self._DATA_WARNING_THRESHOLD,
+                    })
+                self.logger.info("--> Updated behavioral data")
+                if infusion_pump:
+                    self._emit_infusion_count()
 
-        # Auto-stop when firmware signals all Pavlovian trials are complete
-        if (entry_dict.get('device') == 'PAVLOV'
+        # Auto-stop when firmware signals all Pavlovian trials are complete.
+        # A completion that was already dequeued when restart swapped the
+        # buffers belongs to the previous run.
+        if (not stale
+                and entry_dict.get('device') == 'PAVLOV'
                 and entry_dict.get('event') == 'ALL_TRIALS_COMPLETE'
                 and self.program_running):
             self.logger.info("All Pavlovian trials complete, stopping program")
@@ -1076,7 +1180,8 @@ class REACHER:
         missed = int(event.get('missed', 0))
         self._write_event_log({"type": "frame", "timestamp": ts, "missed": missed})
         with self.thread_lock:
-            self.frame_data.append(ts)
+            if self._dequeued_epoch_is_current():
+                self.frame_data.append(ts)
         if missed > 0:
             self.logger.warning(f"--> Dropped {missed} microscope frame(s) before timestamp {ts}")
         else:
@@ -1089,7 +1194,8 @@ class REACHER:
         ts = int(event.get('timestamp'))
         self._write_event_log({"type": "slm", "timestamp": ts})
         with self.thread_lock:
-            self.slm_data.append(ts)
+            if self._dequeued_epoch_is_current():
+                self.slm_data.append(ts)
         self.logger.info("--> Updated SLM timestamp data")
         self._emit("event", {
             "device": "SLM",
@@ -1713,13 +1819,24 @@ class REACHER:
         in-memory data and counters, and resets timing.  The serial connection
         and hardware configuration are preserved.  program_running stays True
         throughout to avoid triggering stop_program's re-entrance guard.
+
+        Lines already off the queue, and lines still sitting on it, are written
+        to the event log but do not re-enter the cleared buffers or counters.
         """
         self.logger.info("Restarting program...")
         self._controller_end_received.clear()
         self.send_serial_command({"cmd": 100})
         time.sleep(1)
 
+        # Take lines the queue thread has not dequeued yet, then bump the
+        # epoch in the same critical section as the buffer swap. A handler
+        # that already sampled the old epoch (or a replay of a drained line)
+        # then loses the append. clear_queue() cannot be used here: it stops
+        # the queue thread, and the new session still needs it.
+        pending, saw_sentinel = self._take_queued_lines()
         with self.thread_lock:
+            old_epoch = self._record_epoch
+            self._record_epoch += 1
             self.behavior_data = []
             self._event_type_counts = {}
             self.frame_data = []
@@ -1732,6 +1849,8 @@ class REACHER:
             self._segment_exports = []
             self._segment_event_counts = []
             self._data_warning_emitted = False
+
+        self._requeue_for_epoch(pending, old_epoch, saw_sentinel)
 
         self.paused_time = 0
         self.paused_start_time = None
