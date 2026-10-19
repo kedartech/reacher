@@ -11,6 +11,7 @@ The barrier below only widens that gap. The record path after it is the real
 """
 
 import json
+import queue
 import threading
 import time
 from unittest.mock import Mock
@@ -115,3 +116,112 @@ def test_restart_drops_infusion_dequeued_before_clear(monkeypatch):
         kernel.queue.put(None)
         if kernel.queue_thread.is_alive():
             kernel.queue_thread.join(timeout=2)
+
+
+def _behavior_rows(kernel):
+    kernel.flush_event_log()
+    rows = []
+    with open(kernel.get_event_log_path()) as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if row.get("type") == "behavior":
+                rows.append(row)
+    return rows
+
+
+def _start_queue_thread_held(kernel):
+    """Start the queue thread and hold its first ``get`` until the event is set.
+
+    Restart drains with ``get_nowait``, so a line put after this returns stays
+    queued. The thread is alive, which is the path that requeues instead of
+    logging on the restart thread.
+    """
+    release = threading.Event()
+    entered = threading.Event()
+    real_get = kernel.queue.get
+
+    def _get(*args, **kwargs):
+        if not entered.is_set():
+            entered.set()
+            release.wait(timeout=5)
+        return real_get(*args, **kwargs)
+
+    kernel.queue.get = _get
+    kernel.queue_thread.start()
+    assert entered.wait(timeout=5), "queue thread did not reach get"
+    return release
+
+
+def _stop_queue_thread(kernel, release):
+    release.set()
+    kernel.serial_flag.set()
+    try:
+        kernel.queue.put_nowait(None)
+    except queue.Full:
+        pass
+    if kernel.queue_thread.is_alive():
+        kernel.queue_thread.join(timeout=2)
+
+
+# A line still on the queue when restart drains it. 2500 is the second
+# pre-restart infusion from the original race (2499 is the one already dequeued).
+_QUEUED_BEFORE_RESTART = {
+    "level": "007",
+    "device": "PUMP_1",
+    "pin": 4,
+    "event": "INFUSION",
+    "start_timestamp": 2500,
+    "end_timestamp": 2500,
+}
+
+# Occupies the only free slot after the drain, so the requeue cannot put 2500 back.
+_RESTART_FILLER = {
+    "level": "007",
+    "device": "PUMP_1",
+    "pin": 4,
+    "event": "INFUSION",
+    "start_timestamp": 3001,
+    "end_timestamp": 3001,
+}
+
+
+def test_restart_full_requeue_keeps_pre_restart_line_in_event_log(monkeypatch):
+    """A pre-restart line that cannot be requeued is still written to event_log.jsonl.
+
+    The queue is drained, then filled to maxsize before the requeue. ``put_nowait``
+    raises ``queue.Full`` and the line is only logged at error. It must still reach
+    the event log, and it must not re-enter the cleared session.
+    """
+    monkeypatch.setattr("reacher.kernel.reacher.time", _NoSleep())
+
+    kernel = REACHER(session_id="restart-requeue-full")
+    kernel.ser = Mock(is_open=True, baudrate=115200)
+    kernel.program_running = True
+    kernel.program_flag.clear()
+    kernel.serial_flag.clear()
+    kernel.queue = queue.Queue(maxsize=1)
+
+    release = _start_queue_thread_held(kernel)
+    try:
+        kernel.queue.put_nowait(json.dumps(_QUEUED_BEFORE_RESTART))
+        real_take = kernel._take_queued_lines
+
+        def _fill_after_drain():
+            pending, saw_sentinel = real_take()
+            assert pending, "pre-restart line was not waiting on the queue"
+            kernel.queue.put_nowait(json.dumps(_RESTART_FILLER))
+            return pending, saw_sentinel
+
+        kernel._take_queued_lines = _fill_after_drain
+        kernel.restart_program()
+
+        timestamps = [row.get("start_timestamp") for row in _behavior_rows(kernel)]
+        assert 2500 in timestamps, f"pre-restart line missing from event log: {timestamps}"
+        buffered = [row.get("start_timestamp") for row in kernel.get_behavior_data()]
+        assert 2500 not in buffered
+        assert kernel.get_total_infusion_count() == 0
+        assert kernel.get_infusions_by_pump() == {"PUMP_1": 0, "PUMP_2": 0}
+    finally:
+        _stop_queue_thread(kernel, release)
