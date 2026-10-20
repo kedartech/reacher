@@ -2,6 +2,7 @@ import logging
 import os
 import queue
 import json
+import threading
 import time
 
 import pytest
@@ -1584,3 +1585,42 @@ class TestStopAfterFirmwareEnd:
 
         wait.assert_called_once()
         assert "Timed out waiting for CONTROLLER END" in caplog.text
+
+    def test_end_from_restart_does_not_satisfy_next_stop(self, instance, mocker, caplog):
+        # Restart's own cmd 100 makes the firmware send END for the run it replaces.
+        instance.start_program()
+
+        def firmware(command):
+            if command.get("cmd") == 100:
+                instance.handle_data(self.END)
+
+        with patch.object(instance, "send_serial_command", side_effect=firmware), \
+                patch("reacher.kernel.reacher.time.sleep"):
+            instance.restart_program()
+        assert not instance._controller_end_received.is_set()
+
+        ev = instance._controller_end_received
+        wait = mocker.patch.object(ev, "wait", side_effect=lambda timeout=None: ev.is_set())
+        with patch("reacher.kernel.reacher.time.sleep"), \
+                caplog.at_level(logging.WARNING, logger="test.stopafterend"):
+            instance.stop_program()
+
+        wait.assert_called_once()
+        assert "Timed out waiting for CONTROLLER END" in caplog.text
+
+    def test_late_end_from_restart_is_consumed_before_new_run(self, instance):
+        # The replaced run's END can be handled after restart's sleep (a slow
+        # queue, or lines requeued at the buffer swap). It must not carry over.
+        instance.start_program()
+        timer = threading.Timer(0.05, instance.handle_data, (self.END,))
+
+        def firmware(command):
+            if command.get("cmd") == 100:
+                timer.start()
+
+        with patch.object(instance, "send_serial_command", side_effect=firmware), \
+                patch("reacher.kernel.reacher.time.sleep"):
+            instance.restart_program()
+        timer.join()
+
+        assert not instance._controller_end_received.is_set()
