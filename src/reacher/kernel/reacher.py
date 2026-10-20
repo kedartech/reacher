@@ -1751,6 +1751,11 @@ class REACHER:
         if self.program_flag.is_set():
             self.program_flag.clear()
 
+        # The END that cmd 100 produced belongs to the run being replaced. Let
+        # the queue thread handle it, then clear the flag, so the next Stop
+        # waits for this run's own END. No new END can arrive before cmd 101.
+        self._controller_end_received.wait(timeout=1.0)
+        self._controller_end_received.clear()
         self.send_serial_command({"cmd": 101})
         self.program_start_time = time.time()
 
