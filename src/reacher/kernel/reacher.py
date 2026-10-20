@@ -231,6 +231,10 @@ class REACHER:
         # running cannot append into the buffers the swap just installed.
         self._record_epoch: int = 0
         self._dequeued_epoch = threading.local()
+        # Close must not take thread_lock: send_serial_command holds it across
+        # its write, and a caller that already owns it would deadlock. This
+        # lock only covers the post-pause flush+close.
+        self._serial_close_lock: threading.Lock = threading.Lock()
         self.serial_flag: threading.Event = threading.Event()
         self.program_flag: threading.Event = threading.Event()
         self.program_running: bool = False
@@ -574,10 +578,18 @@ class REACHER:
             self.serial_flag.set()
             self.logger.info("---> Serial flag set to terminate threads")
             if self.ser.is_open:
+                # Left unlocked. destroy_session and a second close_serial can
+                # both close this port during the drain pause; holding the
+                # close lock across it deadlocks that nested close.
                 time.sleep(0.5)
-                self.ser.flush()
-                self.ser.close()
-                self.logger.info("---> Serial port closed")
+            # flush() raises PortNotOpenError if the port was closed during the
+            # pause. Re-check under the close lock so overlapping closes flush
+            # at most once.
+            with self._serial_close_lock:
+                if self.ser.is_open:
+                    self.ser.flush()
+                    self.ser.close()
+                    self.logger.info("---> Serial port closed")
             self.logger.info("---> Waiting for serial thread to terminate...")
             self.serial_thread.join(timeout=5)
             self.logger.info("---> Serial thread terminated")
